@@ -14,10 +14,16 @@ async function initDB() {
       max_members INTEGER DEFAULT 20,
       weapon_level INTEGER DEFAULT 1,
       bed_level INTEGER DEFAULT 1,
+      description TEXT DEFAULT '',
+      tax_rate INTEGER DEFAULT 100,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(guild_id, role_id)
     )
   `);
+  // Backfill columns for cults rows that already existed before this update
+  await pool.query(`ALTER TABLE cults ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE cults ADD COLUMN IF NOT EXISTS tax_rate INTEGER DEFAULT 100`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cult_members (
       user_id TEXT NOT NULL,
@@ -51,6 +57,26 @@ async function initDB() {
       prisoners TEXT[] DEFAULT '{}',
       status TEXT DEFAULT 'pending',
       started_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // Personal wallets — source of the daily cult tax
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallets (
+      user_id TEXT NOT NULL,
+      guild_id TEXT NOT NULL,
+      balance INTEGER DEFAULT 0,
+      last_work TIMESTAMPTZ,
+      PRIMARY KEY (user_id, guild_id)
+    )
+  `);
+
+  // Single-row table tracking when the daily tax last ran, so a bot
+  // restart can't trigger it twice in the same day
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tax_schedule (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      last_run DATE
     )
   `);
 }
@@ -89,6 +115,22 @@ async function getMemberCult(guildId, userId) {
   return rows[0] || null;
 }
 
+// Returns { cult, rank } where rank is 'leader', 'coleader', 'general',
+// 'soldier', 'recruit', or null if the user isn't in any cult.
+async function getCultAndRank(guildId, userId) {
+  let cult = await getCultByLeader(guildId, userId);
+  if (cult) return { cult, rank: 'leader' };
+
+  cult = await getMemberCult(guildId, userId);
+  if (!cult) return { cult: null, rank: null };
+
+  const { rows } = await pool.query(
+    `SELECT rank FROM cult_members WHERE user_id = $1 AND cult_id = $2`,
+    [userId, cult.id]
+  );
+  return { cult, rank: rows[0]?.rank || 'recruit' };
+}
+
 async function syncMembers(guild, cult) {
   const role = guild.roles.cache.get(cult.role_id);
   if (!role) return;
@@ -117,7 +159,7 @@ async function getMemberCount(cultId) {
 }
 
 function getRankEmoji(rank) {
-  const emojis = { recruit: '⚔️', soldier: '🛡️', general: '⭐', leader: '👑' };
+  const emojis = { recruit: '⚔️', soldier: '🛡️', general: '⭐', coleader: '👑', leader: '👑' };
   return emojis[rank] || '⚔️';
 }
 
@@ -125,6 +167,16 @@ const UPGRADE_COSTS = {
   expand: 500,
   weapons: 300,
   beds: 400,
+};
+
+// Who is allowed to set which target rank via /cult rank.
+// Leader can set anything below themselves, including Co-Leader.
+// Co-Leader can promote up to General, but not to Co-Leader (Leader-only).
+// General can only manage Soldiers, per the original spec ("Generals ... choose soldiers").
+const PROMOTE_PERMISSIONS = {
+  leader: ['recruit', 'soldier', 'general', 'coleader'],
+  coleader: ['recruit', 'soldier', 'general'],
+  general: ['recruit', 'soldier'],
 };
 
 function calcWarScore(cult, memberCount) {
@@ -136,6 +188,88 @@ function calcWarScore(cult, memberCount) {
 function calcRespawnChance(bedLevel) {
   return Math.min(10 + (bedLevel - 1) * 10, 90); // 10% base, +10% per level, max 90%
 }
+
+// ── Daily Tax Collection ─────────────────────────────────────────────────────
+// Pulls each cult's tax_rate from every member's personal wallet (including
+// the Leader's) and deposits the total into the cult's treasury. Members who
+// can't afford the full tax just pay what they have.
+const TAX_HOUR_UTC = 0;   // 00:00 UTC
+const TAX_MINUTE_UTC = 0;
+
+async function getLastTaxRun() {
+  const { rows } = await pool.query(`SELECT last_run FROM tax_schedule WHERE id = 1`);
+  return rows[0]?.last_run || null;
+}
+
+async function setLastTaxRun(dateStr) {
+  await pool.query(`
+    INSERT INTO tax_schedule (id, last_run) VALUES (1, $1)
+    ON CONFLICT (id) DO UPDATE SET last_run = $1
+  `, [dateStr]);
+}
+
+async function collectDailyTax() {
+  const { rows: cults } = await pool.query(`SELECT * FROM cults`);
+
+  for (const cult of cults) {
+    const { rows: members } = await pool.query(
+      `SELECT user_id FROM cult_members WHERE cult_id = $1`,
+      [cult.id]
+    );
+
+    const payerIds = new Set(members.map(m => m.user_id));
+    payerIds.add(cult.leader_id); // Leader pays too
+
+    let totalCollected = 0;
+
+    for (const userId of payerIds) {
+      const { rows: walletRows } = await pool.query(
+        `SELECT balance FROM wallets WHERE user_id = $1 AND guild_id = $2`,
+        [userId, cult.guild_id]
+      );
+      const balance = walletRows[0]?.balance || 0;
+      const taxPaid = Math.min(balance, cult.tax_rate);
+
+      if (taxPaid > 0) {
+        await pool.query(
+          `UPDATE wallets SET balance = balance - $1 WHERE user_id = $2 AND guild_id = $3`,
+          [taxPaid, userId, cult.guild_id]
+        );
+        totalCollected += taxPaid;
+      }
+    }
+
+    if (totalCollected > 0) {
+      await pool.query(`UPDATE cults SET gold = gold + $1 WHERE id = $2`, [totalCollected, cult.id]);
+      await pool.query(
+        `INSERT INTO gold_log (cult_id, amount, reason) VALUES ($1, $2, $3)`,
+        [cult.id, totalCollected, 'Daily tax collection']
+      );
+    }
+  }
+}
+
+function startTaxScheduler() {
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      if (now.getUTCHours() !== TAX_HOUR_UTC || now.getUTCMinutes() !== TAX_MINUTE_UTC) return;
+
+      const today = now.toISOString().slice(0, 10);
+      const lastRun = await getLastTaxRun();
+      const lastRunStr = lastRun ? new Date(lastRun).toISOString().slice(0, 10) : null;
+      if (lastRunStr === today) return;
+
+      await collectDailyTax();
+      await setLastTaxRun(today);
+      console.log(`✅ Daily cult tax collected at ${now.toISOString()}`);
+    } catch (err) {
+      console.error('❌ Tax collection error:', err);
+    }
+  }, 60 * 1000); // check every minute
+}
+
+startTaxScheduler();
 
 // ── Command ──────────────────────────────────────────────────────────────────
 module.exports = {
@@ -164,7 +298,7 @@ module.exports = {
 
     .addSubcommand(sub =>
       sub.setName('rank')
-        .setDescription('Set a member\'s rank (cult leader only)')
+        .setDescription('Set a member\'s rank')
         .addUserOption(opt => opt.setName('member').setDescription('Member to rank').setRequired(true))
         .addStringOption(opt =>
           opt.setName('rank')
@@ -174,8 +308,17 @@ module.exports = {
               { name: '⚔️ Recruit', value: 'recruit' },
               { name: '🛡️ Soldier', value: 'soldier' },
               { name: '⭐ General', value: 'general' },
+              { name: '👑 Co-Leader', value: 'coleader' },
             )
         )
+    )
+
+    .addSubcommand(sub =>
+      sub.setName('settings')
+        .setDescription('View or edit your cult\'s rules')
+        .addStringOption(opt => opt.setName('description').setDescription('New cult description (Leader only)').setRequired(false))
+        .addIntegerOption(opt => opt.setName('tax').setDescription('New daily tax per member, in gold (Leader only)').setRequired(false).setMinValue(0))
+        .addRoleOption(opt => opt.setName('role').setDescription('New cult role (Leader only)').setRequired(false))
     )
 
     .addSubcommand(sub =>
@@ -199,11 +342,8 @@ module.exports = {
     )
 
     .addSubcommand(sub =>
-      sub.setName('addgold')
-        .setDescription('Add gold to a cult (staff only)')
-        .addRoleOption(opt => opt.setName('role').setDescription('Cult role').setRequired(true))
-        .addIntegerOption(opt => opt.setName('amount').setDescription('Amount of gold').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('reason').setDescription('Reason').setRequired(false))
+      sub.setName('forcetax')
+        .setDescription('Manually trigger daily tax collection right now (Admin only)')
     )
 
     .addSubcommand(sub =>
@@ -246,6 +386,7 @@ module.exports = {
             { name: '👥 Max Members', value: '20', inline: true },
             { name: '💰 Gold', value: '0', inline: true },
             { name: '⚔️ Weapon Level', value: '1', inline: true },
+            { name: '💸 Daily Tax', value: `${cult.tax_rate} gold/member`, inline: true },
           )]
       });
     }
@@ -274,6 +415,7 @@ module.exports = {
         embeds: [new EmbedBuilder()
           .setTitle(`⚔️ ${cult.name}`)
           .setColor(discordRole?.color || 0x6C63FF)
+          .setDescription(cult.description || '*No description set*')
           .addFields(
             { name: '👑 Leader', value: `<@${cult.leader_id}>`, inline: true },
             { name: '🎭 Role', value: `<@&${cult.role_id}>`, inline: true },
@@ -281,6 +423,7 @@ module.exports = {
             { name: '👥 Members', value: `${memberCount}/${cult.max_members}`, inline: true },
             { name: '⚔️ Weapon Level', value: `${cult.weapon_level} (+${weaponBonus}% attack)`, inline: true },
             { name: '🛏️ Bed Level', value: `${cult.bed_level} (${respawnChance}% respawn)`, inline: true },
+            { name: '💸 Daily Tax', value: `${cult.tax_rate} gold/member`, inline: true },
           )
           .setTimestamp()]
       });
@@ -304,7 +447,7 @@ module.exports = {
 
       const { rows: members } = await pool.query(
         `SELECT * FROM cult_members WHERE cult_id = $1 ORDER BY
-          CASE rank WHEN 'leader' THEN 1 WHEN 'general' THEN 2 WHEN 'soldier' THEN 3 ELSE 4 END`,
+          CASE rank WHEN 'leader' THEN 1 WHEN 'coleader' THEN 2 WHEN 'general' THEN 3 WHEN 'soldier' THEN 4 ELSE 5 END`,
         [cult.id]
       );
 
@@ -322,11 +465,24 @@ module.exports = {
 
     // ── RANK ──────────────────────────────────────────────────────────────────
     if (sub === 'rank') {
-      const cult = await getCultByLeader(guild.id, interaction.user.id);
-      if (!cult) return interaction.reply({ content: '⚠️ You are not a cult leader!', flags: 64 });
+      const { cult, rank: myRank } = await getCultAndRank(guild.id, interaction.user.id);
+      if (!cult || !myRank) return interaction.reply({ content: '⚠️ You are not in a cult!', flags: 64 });
+
+      const allowedTargets = PROMOTE_PERMISSIONS[myRank];
+      if (!allowedTargets) {
+        return interaction.reply({ content: '⚠️ You don\'t have permission to change ranks.', flags: 64 });
+      }
 
       const target = interaction.options.getUser('member');
       const newRank = interaction.options.getString('rank');
+
+      if (target.id === cult.leader_id) {
+        return interaction.reply({ content: '⚠️ The Leader\'s rank can\'t be changed this way.', flags: 64 });
+      }
+
+      if (!allowedTargets.includes(newRank)) {
+        return interaction.reply({ content: `⚠️ As a **${myRank}**, you can't set that rank.`, flags: 64 });
+      }
 
       const { rows } = await pool.query(
         `SELECT * FROM cult_members WHERE user_id = $1 AND cult_id = $2`,
@@ -344,6 +500,57 @@ module.exports = {
           .setTitle('⭐ Rank Updated!')
           .setColor(0xffd700)
           .setDescription(`<@${target.id}> is now a **${newRank}** ${getRankEmoji(newRank)} in **${cult.name}**!`)]
+      });
+    }
+
+    // ── SETTINGS ──────────────────────────────────────────────────────────────
+    if (sub === 'settings') {
+      const { cult, rank: myRank } = await getCultAndRank(guild.id, interaction.user.id);
+      if (!cult) return interaction.reply({ content: '⚠️ You are not in a cult!', flags: 64 });
+
+      if (myRank !== 'leader' && myRank !== 'coleader') {
+        return interaction.reply({ content: '⚠️ Only the Leader and Co-Leader can access cult settings.', flags: 64 });
+      }
+
+      const newDescription = interaction.options.getString('description');
+      const newTax = interaction.options.getInteger('tax');
+      const newRole = interaction.options.getRole('role');
+      const wantsToEdit = newDescription !== null || newTax !== null || newRole !== null;
+
+      if (wantsToEdit && myRank !== 'leader') {
+        return interaction.reply({ content: '⚠️ Co-Leaders can view settings but only the Leader can change them.', flags: 64 });
+      }
+
+      if (wantsToEdit) {
+        if (newRole) {
+          const existingForRole = await getCultByRole(guild.id, newRole.id);
+          if (existingForRole && existingForRole.id !== cult.id) {
+            return interaction.reply({ content: '⚠️ That role is already linked to another cult!', flags: 64 });
+          }
+        }
+
+        await pool.query(
+          `UPDATE cults SET
+            description = COALESCE($1, description),
+            tax_rate = COALESCE($2, tax_rate),
+            role_id = COALESCE($3, role_id)
+           WHERE id = $4`,
+          [newDescription, newTax, newRole?.id || null, cult.id]
+        );
+      }
+
+      const updated = await getCultById(cult.id);
+
+      return interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setTitle(`⚙️ ${updated.name} — Settings`)
+          .setColor(0x6C63FF)
+          .addFields(
+            { name: '📝 Description', value: updated.description || '*No description set*' },
+            { name: '💸 Daily Tax', value: `${updated.tax_rate} gold/member`, inline: true },
+            { name: '🎭 Role', value: `<@&${updated.role_id}>`, inline: true },
+            { name: '👤 Your Access', value: myRank === 'leader' ? 'Full edit access' : 'View only', inline: true },
+          )]
       });
     }
 
@@ -414,30 +621,23 @@ module.exports = {
           .setColor(0xffd700)
           .addFields(
             { name: 'Current Gold', value: `**${cult.gold}** 💰` },
+            { name: 'Daily Tax', value: `${cult.tax_rate} gold/member`, inline: true },
             { name: 'Upgrade Costs', value: `👥 Expand: 500g\n⚔️ Weapons: 300g\n🛏️ Beds: 400g` },
             { name: 'Recent Transactions', value: logLines }
           )]
       });
     }
 
-    // ── ADD GOLD ──────────────────────────────────────────────────────────────
-    if (sub === 'addgold') {
-      const role = interaction.options.getRole('role');
-      const amount = interaction.options.getInteger('amount');
-      const reason = interaction.options.getString('reason') || 'Staff grant';
+    // ── FORCE TAX (testing helper) ──────────────────────────────────────────────
+    if (sub === 'forcetax') {
+      if (!interaction.member.permissions.has('Administrator')) {
+        return interaction.reply({ content: '⚠️ Admins only.', flags: 64 });
+      }
 
-      const cult = await getCultByRole(guild.id, role.id);
-      if (!cult) return interaction.reply({ content: '⚠️ That role is not a registered cult!', flags: 64 });
+      await collectDailyTax();
+      await setLastTaxRun(new Date().toISOString().slice(0, 10));
 
-      await pool.query(`UPDATE cults SET gold = gold + $1 WHERE id = $2`, [amount, cult.id]);
-      await pool.query(`INSERT INTO gold_log (cult_id, amount, reason) VALUES ($1, $2, $3)`, [cult.id, amount, reason]);
-
-      return interaction.reply({
-        embeds: [new EmbedBuilder()
-          .setTitle('💰 Gold Added!')
-          .setColor(0xffd700)
-          .setDescription(`**+${amount}** gold added to **${cult.name}**!\nReason: ${reason}\nNew total: **${cult.gold + amount}** 💰`)]
-      });
+      return interaction.reply({ content: '✅ Daily tax collected manually for every cult.', flags: 64 });
     }
 
     // ── WAR ───────────────────────────────────────────────────────────────────
@@ -548,7 +748,7 @@ module.exports = {
       if (cults.length === 0) return interaction.editReply({ content: '📭 No cults registered yet!' });
 
       const lines = cults.map((c, i) =>
-        `**${i + 1}.** <@&${c.role_id}> — **${c.name}**\n👥 ${c.member_count}/${c.max_members} | 💰 ${c.gold}g | ⚔️ Weapons Lv${c.weapon_level} | 🛏️ Beds Lv${c.bed_level}`
+        `**${i + 1}.** <@&${c.role_id}> — **${c.name}**\n👥 ${c.member_count}/${c.max_members} | 💰 ${c.gold}g | ⚔️ Weapons Lv${c.weapon_level} | 🛏️ Beds Lv${c.bed_level} | 💸 Tax ${c.tax_rate}g`
       ).join('\n\n');
 
       return interaction.editReply({
