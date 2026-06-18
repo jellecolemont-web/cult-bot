@@ -49,7 +49,7 @@ loadCommands(commandsPath);
 
 const rest = new REST({ version: '10' }).setToken(process.env.CULT_TOKEN);
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`⚔️ Cult Bot logged in as ${client.user.tag}`);
 
   try {
