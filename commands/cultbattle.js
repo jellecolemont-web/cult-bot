@@ -47,6 +47,32 @@ function calcRoundPower(cult, fighterPower, stance) {
   return Math.floor(base * (0.8 + Math.random() * 0.4));
 }
 
+const START_HEALTH = 100;
+
+const ATTACK_LINES = [
+  "{a} sends a wave of soldiers charging {b}'s gates, dealing {dmg} damage!",
+  "{a} sets fire to {b}'s supply tents, dealing {dmg} damage!",
+  "{a} ambushes {b}'s scouts in the night, dealing {dmg} damage!",
+  "{a} breaches {b}'s defenses with a battering ram, dealing {dmg} damage!",
+  "{a} rains arrows down on {b}'s ranks, dealing {dmg} damage!",
+  "{a} poisons {b}'s well, dealing {dmg} damage!",
+  "{a} unleashes their General on {b}'s frontline, dealing {dmg} damage!",
+  "{a} sabotages {b}'s war drums, dealing {dmg} damage!",
+];
+const HEAL_LINES = [
+  "{a} rallies their troops with a fiery speech, regaining {heal} health!",
+  "{a}'s healers patch up the wounded, regaining {heal} health!",
+  "{a} digs in and reinforces the walls, regaining {heal} health!",
+  "{a} receives emergency supplies, regaining {heal} health!",
+];
+
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function healthBar(hp, max = START_HEALTH, length = 12) {
+  const filled = Math.max(0, Math.min(length, Math.round((hp / max) * length)));
+  return '█'.repeat(filled) + '░'.repeat(length - filled);
+}
+
 // ── Command ──────────────────────────────────────────────────────────────────
 module.exports = {
   data: new SlashCommandBuilder()
@@ -128,49 +154,70 @@ module.exports = {
       });
       stance1 = click.customId.split('_')[1];
       await click.update({
-        embeds: [new EmbedBuilder().setColor(0x6C63FF).setDescription(`**${cult1.name}** chooses **${STANCE_LABEL[stance1]}** and charges!`)],
+        embeds: [new EmbedBuilder().setColor(0x6C63FF).setDescription(`**${cult1.name}** chooses **${STANCE_LABEL[stance1]}** and marches on!`)],
         components: []
       });
     } catch {
       await interaction.editReply({
-        embeds: [new EmbedBuilder().setColor(0x6C63FF).setDescription(`No stance chosen — **${cult1.name}** proceeds with **${STANCE_LABEL.balanced}**.`)],
+        embeds: [new EmbedBuilder().setColor(0x6C63FF).setDescription(`No stance chosen — **${cult1.name}** goes with **${STANCE_LABEL.balanced}**.`)],
         components: []
       });
     }
 
     const stance2 = cult2.war_stance || 'balanced';
 
-    // ── Best of 3 rounds ──
-    let wins1 = 0, wins2 = 0;
-    const roundLog = [];
+    // ── HP-based turn battle ──
+    // Each side's max HP scales with fighter power, so a bigger/stronger cult
+    // can absorb more hits — member count and rank weighting both matter here.
+    const maxHp1 = START_HEALTH + power1 * 5;
+    const maxHp2 = START_HEALTH + power2Region * 5;
+    let hp1 = maxHp1, hp2 = maxHp2;
 
-    for (let round = 1; round <= 3; round++) {
-      if (wins1 === 2 || wins2 === 2) break;
+    const MAX_TURNS = 6;
+    let attackerIs1 = Math.random() < 0.5;
+    const turnLog = [];
 
-      const score1 = calcRoundPower(cult1, power1, stance1);
-      const score2 = calcRoundPower(cult2, power2Region, stance2);
-      const roundWinner = score1 > score2 ? 1 : 2;
-      if (roundWinner === 1) wins1++; else wins2++;
-      roundLog.push({ round, score1, score2, winner: roundWinner });
+    for (let turn = 1; turn <= MAX_TURNS; turn++) {
+      if (hp1 <= 0 || hp2 <= 0) break;
 
-      await interaction.followUp({
-        embeds: [new EmbedBuilder()
-          .setColor(roundWinner === 1 ? 0x00ff00 : 0xff0000)
-          .setTitle(`⚔️ Round ${round}/3`)
-          .addFields(
-            { name: cult1.name, value: `${score1}`, inline: true },
-            { name: cult2.name, value: `${score2}`, inline: true },
-            { name: 'Round won by', value: roundWinner === 1 ? `**${cult1.name}**` : `**${cult2.name}**` },
-          )]
-      });
+      const attackerName = attackerIs1 ? cult1.name : cult2.name;
+      const defenderName = attackerIs1 ? cult2.name : cult1.name;
+      const attackerCultObj = attackerIs1 ? cult1 : cult2;
+      const attackerPower = attackerIs1 ? power1 : power2Region;
+      const attackerStance = attackerIs1 ? stance1 : stance2;
+      const isHeal = Math.random() < 0.2;
 
-      if (round < 3) await new Promise(r => setTimeout(r, 1500));
+      if (isHeal) {
+        const heal = 8 + Math.floor(Math.random() * 13); // 8-20
+        if (attackerIs1) hp1 = Math.min(maxHp1, hp1 + heal); else hp2 = Math.min(maxHp2, hp2 + heal);
+        turnLog.push(pick(HEAL_LINES).replace('{a}', `**${attackerName}**`).replace('{heal}', `**+${heal}**`));
+      } else {
+        const raw = calcRoundPower(attackerCultObj, attackerPower, attackerStance);
+        const dmg = Math.max(5, Math.floor(raw / 8)); // scale the power roll down into a per-turn HP chunk
+        if (attackerIs1) hp2 = Math.max(0, hp2 - dmg); else hp1 = Math.max(0, hp1 - dmg);
+        turnLog.push(pick(ATTACK_LINES).replace('{a}', `**${attackerName}**`).replace('{b}', `**${defenderName}**`).replace('{dmg}', `**-${dmg}**`));
+      }
+
+      attackerIs1 = !attackerIs1;
     }
 
-    const cult1Wins = wins1 > wins2;
+    const cult1Wins = hp1 === hp2 ? Math.random() < 0.5 : hp1 > hp2;
     const winnerCult = cult1Wins ? cult1 : cult2;
     const winnerRole = cult1Wins ? cult1Role : cult2Role;
     const winnerRoster = cult1Wins ? roster1 : roster2;
+    const finalHp1 = Math.max(hp1, 0), finalHp2 = Math.max(hp2, 0);
+
+    // Post the battle log
+    await interaction.followUp({
+      embeds: [new EmbedBuilder()
+        .setTitle('⚔️ Cult Battle in Progress...')
+        .setColor(0x6C63FF)
+        .setDescription(turnLog.map(l => `• ${l}`).join('\n'))
+        .addFields(
+          { name: `${cult1.name}`, value: `${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%`, inline: true },
+          { name: `${cult2.name}`, value: `${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`, inline: true },
+        )]
+    });
 
     // Give reward role to every member of the winning cult
     await guild.members.fetch({ force: false });
@@ -189,8 +236,7 @@ module.exports = {
       }
     }
 
-    const roundRecap = roundLog.map(r => `R${r.round}: ${r.score1} vs ${r.score2} → **${r.winner === 1 ? cult1.name : cult2.name}**`).join('\n');
-    const rewardedMentions = rewarded.map(id => `<@${id}>`).join(' ') || '*Niemand*';
+    const rewardedMentions = rewarded.map(id => `<@${id}>`).join(' ') || '*Nobody*';
 
     await interaction.followUp({
       embeds: [new EmbedBuilder()
@@ -198,14 +244,15 @@ module.exports = {
         .setColor(0xffd700)
         .setDescription(
           `<@&${cult1Role.id}> **vs** <@&${cult2Role.id}>\n` +
-          `🎯 Attack: ${REGION_LABEL[direction]} of **${cult2.name}** (${STANCE_LABEL[stance2]})\n\n` +
-          `**Rounds:**\n${roundRecap}\n\n` +
-          `**Final Score:** ${wins1}-${wins2}`
+          `🎯 Attack: ${REGION_LABEL[direction]} from **${cult2.name}** (${STANCE_LABEL[stance2]})\n\n` +
+          `**Final HP Standings:**\n` +
+          `${cult1.name}: ${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%\n` +
+          `${cult2.name}: ${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`
         )
         .addFields(
           { name: `🏆 Winner`, value: `**${winnerCult.name}** <@&${winnerRole.id}>` },
           { name: `🎁 Rewarded Members (${rewarded.length})`, value: rewardedMentions.slice(0, 1000) },
-          failed.length > 0 ? { name: '⚠️ Not Rewarded', value: `${failed.length} members could not receive a role (possibly left the server)` } : null,
+          failed.length > 0 ? { name: '⚠️ Not Rewarded', value: `${failed.length} members could not receive the role (possibly left the server)` } : null,
         ).filter(Boolean)
         .setTimestamp()]
     });
