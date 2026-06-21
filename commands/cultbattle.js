@@ -1,4 +1,5 @@
-const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+const { createCanvas, loadImage } = require('@napi-rs/canvas');
 const pool = require('../database');
 
 // ── Shared helpers (duplicated from cult.js since commands are separate files) ─
@@ -71,6 +72,129 @@ function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function healthBar(hp, max = START_HEALTH, length = 12) {
   const filled = Math.max(0, Math.min(length, Math.round((hp / max) * length)));
   return '█'.repeat(filled) + '░'.repeat(length - filled);
+}
+
+// ── Canvas rendering (duplicated pattern from catfight.js) ──────────────────
+function intToHex(colorInt) {
+  if (!colorInt) return '#5865F2'; // Discord blurple fallback for roles with no color set
+  return '#' + colorInt.toString(16).padStart(6, '0');
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawTrophy(ctx, cx, topY) {
+  ctx.save();
+  ctx.fillStyle = '#ffd60a';
+  ctx.beginPath();
+  ctx.moveTo(cx - 18, topY);
+  ctx.quadraticCurveTo(cx, topY + 28, cx + 18, topY);
+  ctx.lineTo(cx + 14, topY);
+  ctx.quadraticCurveTo(cx, topY + 18, cx - 14, topY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillRect(cx - 3, topY + 18, 6, 8);
+  ctx.fillRect(cx - 10, topY + 26, 20, 5);
+  ctx.restore();
+}
+
+function drawTombstone(ctx, cx, topY) {
+  ctx.save();
+  ctx.fillStyle = '#9ca3af';
+  ctx.beginPath();
+  ctx.moveTo(cx - 16, topY + 30);
+  ctx.lineTo(cx - 16, topY + 10);
+  ctx.arc(cx, topY + 10, 16, Math.PI, 0);
+  ctx.lineTo(cx + 16, topY + 30);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#374151';
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('RIP', cx, topY + 25);
+  ctx.restore();
+}
+
+async function renderCultBattleImage(sideA, sideB, aWins) {
+  const width = 760, height = 340;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+
+  const bg = ctx.createLinearGradient(0, 0, width, height);
+  bg.addColorStop(0, sideA.color);
+  bg.addColorStop(1, sideB.color);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, width, height);
+
+  const confettiColors = ['#ff595e', '#ffca3a', '#8ac926', '#1982c4', '#6a4c93', '#ffffff'];
+  for (let i = 0; i < 90; i++) {
+    ctx.save();
+    ctx.translate(Math.random() * width, Math.random() * height);
+    ctx.rotate(Math.random() * Math.PI);
+    ctx.fillStyle = confettiColors[Math.floor(Math.random() * confettiColors.length)];
+    ctx.fillRect(-3, -6, 6, 12);
+    ctx.restore();
+  }
+
+  const panelY = 20, panelH = height - 80, panelW = width / 2 - 30;
+
+  async function drawSide(x, side, isWinner) {
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    roundRect(ctx, x, panelY, panelW, panelH, 16);
+    ctx.fill();
+
+    const avatarSize = 150;
+    const avatarX = x + panelW / 2 - avatarSize / 2;
+    const avatarY = panelY + 35;
+
+    try {
+      const avatarImg = await loadImage(side.avatarURL);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.clip();
+      ctx.drawImage(avatarImg, avatarX, avatarY, avatarSize, avatarSize);
+      ctx.restore();
+    } catch (err) {
+      console.error('Avatar load failed:', err.message);
+    }
+
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = isWinner ? '#ffd60a' : '#6c757d';
+    ctx.beginPath();
+    ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(side.name.slice(0, 20), x + panelW / 2, avatarY + avatarSize + 35);
+
+    ctx.font = '14px sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText('Cult Leader', x + panelW / 2, avatarY + avatarSize + 55);
+
+    if (isWinner) drawTrophy(ctx, x + panelW / 2, avatarY - 25);
+    else drawTombstone(ctx, x + panelW / 2, avatarY - 30);
+  }
+
+  await drawSide(15, sideA, aWins);
+  await drawSide(width / 2 + 15, sideB, !aWins);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 48px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('VS', width / 2, height / 2 + 15);
+
+  return canvas.toBuffer('image/png');
 }
 
 // ── Command ──────────────────────────────────────────────────────────────────
@@ -173,7 +297,7 @@ module.exports = {
     const maxHp2 = START_HEALTH + power2Region * 5;
     let hp1 = maxHp1, hp2 = maxHp2;
 
-    const MAX_TURNS = 6;
+    const MAX_TURNS = 60; // safety cap only — battles almost always finish naturally well before this
     let attackerIs1 = Math.random() < 0.5;
     const turnLog = [];
 
@@ -201,18 +325,39 @@ module.exports = {
       attackerIs1 = !attackerIs1;
     }
 
-    const cult1Wins = hp1 === hp2 ? Math.random() < 0.5 : hp1 > hp2;
+    // Safety net: if healing kept both sides alive past the turn cap (rare),
+    // force a decisive finish so a battle never ends without a clear loser.
+    if (hp1 > 0 && hp2 > 0) {
+      if (hp1 <= hp2) {
+        turnLog.push(`💀 After a brutal war of attrition, **${cult1.name}**'s forces finally collapse!`);
+        hp1 = 0;
+      } else {
+        turnLog.push(`💀 After a brutal war of attrition, **${cult2.name}**'s forces finally collapse!`);
+        hp2 = 0;
+      }
+    }
+
+    const cult1Wins = hp2 <= 0;
     const winnerCult = cult1Wins ? cult1 : cult2;
     const winnerRole = cult1Wins ? cult1Role : cult2Role;
     const winnerRoster = cult1Wins ? roster1 : roster2;
     const finalHp1 = Math.max(hp1, 0), finalHp2 = Math.max(hp2, 0);
+
+    // Discord embed descriptions cap at 4096 chars — long wars can run many
+    // turns, so only show the most recent stretch if the log gets long.
+    const DISPLAY_TURN_LIMIT = 20;
+    const displayedTurns = turnLog.length > DISPLAY_TURN_LIMIT
+      ? turnLog.slice(-DISPLAY_TURN_LIMIT)
+      : turnLog;
+    const omittedCount = turnLog.length - displayedTurns.length;
+    const logHeader = omittedCount > 0 ? `*(showing the final ${DISPLAY_TURN_LIMIT} of ${turnLog.length} exchanges)*\n\n` : '';
 
     // Post the battle log
     await interaction.followUp({
       embeds: [new EmbedBuilder()
         .setTitle('⚔️ Cult Battle in Progress...')
         .setColor(0x6C63FF)
-        .setDescription(turnLog.map(l => `• ${l}`).join('\n'))
+        .setDescription(logHeader + displayedTurns.map(l => `• ${l}`).join('\n'))
         .addFields(
           { name: `${cult1.name}`, value: `${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%`, inline: true },
           { name: `${cult2.name}`, value: `${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`, inline: true },
@@ -253,19 +398,49 @@ module.exports = {
       resultFields.push({ name: '⚠️ Not rewarded', value: `${failed.length} member(s) couldn't receive the role (may have left the server, or the bot's role is positioned below the reward role)` });
     }
 
+    // Build the VS image using each cult's Leader as the "face" of their cult
+    let leader1User, leader2User;
+    try { leader1User = await client.users.fetch(cult1.leader_id); } catch (err) { console.error('Leader1 fetch failed:', err.message); }
+    try { leader2User = await client.users.fetch(cult2.leader_id); } catch (err) { console.error('Leader2 fetch failed:', err.message); }
+
+    const fallbackAvatar = 'https://cdn.discordapp.com/embed/avatars/0.png';
+    const sideA = {
+      name: cult1.name,
+      avatarURL: leader1User ? leader1User.displayAvatarURL({ extension: 'png', size: 256 }) : fallbackAvatar,
+      color: intToHex(cult1Role.color),
+    };
+    const sideB = {
+      name: cult2.name,
+      avatarURL: leader2User ? leader2User.displayAvatarURL({ extension: 'png', size: 256 }) : fallbackAvatar,
+      color: intToHex(cult2Role.color),
+    };
+
+    let attachment = null;
+    try {
+      const imageBuffer = await renderCultBattleImage(sideA, sideB, cult1Wins);
+      attachment = new AttachmentBuilder(imageBuffer, { name: 'cultbattle.png' });
+    } catch (err) {
+      console.error('Failed to render cult battle image:', err.message);
+    }
+
+    const resultEmbed = new EmbedBuilder()
+      .setTitle(`🏆 ${winnerCult.name} wins the Cult Battle!`)
+      .setColor(0xffd700)
+      .setDescription(
+        `<@&${cult1Role.id}> **vs** <@&${cult2Role.id}>\n` +
+        `🎯 Attack: ${REGION_LABEL[direction]} of **${cult2.name}** (${STANCE_LABEL[stance2]})\n\n` +
+        `**Final HP:**\n` +
+        `${cult1.name}: ${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%\n` +
+        `${cult2.name}: ${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`
+      )
+      .addFields(...resultFields)
+      .setTimestamp();
+
+    if (attachment) resultEmbed.setImage('attachment://cultbattle.png');
+
     await interaction.followUp({
-      embeds: [new EmbedBuilder()
-        .setTitle(`🏆 ${winnerCult.name} wins the Cult Battle!`)
-        .setColor(0xffd700)
-        .setDescription(
-          `<@&${cult1Role.id}> **vs** <@&${cult2Role.id}>\n` +
-          `🎯 Attack: ${REGION_LABEL[direction]} of **${cult2.name}** (${STANCE_LABEL[stance2]})\n\n` +
-          `**Final HP:**\n` +
-          `${cult1.name}: ${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%\n` +
-          `${cult2.name}: ${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`
-        )
-        .addFields(...resultFields)
-        .setTimestamp()]
+      embeds: [resultEmbed],
+      files: attachment ? [attachment] : []
     });
   }
 };
