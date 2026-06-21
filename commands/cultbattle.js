@@ -300,6 +300,21 @@ module.exports = {
     const MAX_TURNS = 60; // safety cap only — battles almost always finish naturally well before this
     let attackerIs1 = Math.random() < 0.5;
     const turnLog = [];
+    const VISIBLE_LINES = 4; // sliding window — oldest line drops off as a new one comes in
+
+    function buildLiveEmbed(hpA, hpB, finished) {
+      const windowLines = turnLog.slice(-VISIBLE_LINES);
+      return new EmbedBuilder()
+        .setTitle(finished ? '⚔️ Cult Battle — Final Blow!' : '⚔️ Cult Battle in Progress...')
+        .setColor(0x6C63FF)
+        .setDescription(windowLines.map(l => `• ${l}`).join('\n') || '*The armies are gathering...*')
+        .addFields(
+          { name: `${cult1.name}`, value: `${healthBar(Math.max(hpA, 0), maxHp1)} ${Math.round((Math.max(hpA, 0) / maxHp1) * 100)}%`, inline: true },
+          { name: `${cult2.name}`, value: `${healthBar(Math.max(hpB, 0), maxHp2)} ${Math.round((Math.max(hpB, 0) / maxHp2) * 100)}%`, inline: true },
+        );
+    }
+
+    const liveMsg = await interaction.followUp({ embeds: [buildLiveEmbed(hp1, hp2, false)] });
 
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
       if (hp1 <= 0 || hp2 <= 0) break;
@@ -323,6 +338,14 @@ module.exports = {
       }
 
       attackerIs1 = !attackerIs1;
+
+      try {
+        await liveMsg.edit({ embeds: [buildLiveEmbed(hp1, hp2, hp1 <= 0 || hp2 <= 0)] });
+      } catch (err) {
+        console.error('Live battle edit failed:', err.message);
+      }
+
+      if (hp1 > 0 && hp2 > 0) await new Promise(r => setTimeout(r, 1500));
     }
 
     // Safety net: if healing kept both sides alive past the turn cap (rare),
@@ -335,6 +358,7 @@ module.exports = {
         turnLog.push(`💀 After a brutal war of attrition, **${cult2.name}**'s forces finally collapse!`);
         hp2 = 0;
       }
+      try { await liveMsg.edit({ embeds: [buildLiveEmbed(hp1, hp2, true)] }); } catch (err) { console.error('Final live edit failed:', err.message); }
     }
 
     const cult1Wins = hp2 <= 0;
@@ -342,27 +366,6 @@ module.exports = {
     const winnerRole = cult1Wins ? cult1Role : cult2Role;
     const winnerRoster = cult1Wins ? roster1 : roster2;
     const finalHp1 = Math.max(hp1, 0), finalHp2 = Math.max(hp2, 0);
-
-    // Discord embed descriptions cap at 4096 chars — long wars can run many
-    // turns, so only show the most recent stretch if the log gets long.
-    const DISPLAY_TURN_LIMIT = 20;
-    const displayedTurns = turnLog.length > DISPLAY_TURN_LIMIT
-      ? turnLog.slice(-DISPLAY_TURN_LIMIT)
-      : turnLog;
-    const omittedCount = turnLog.length - displayedTurns.length;
-    const logHeader = omittedCount > 0 ? `*(showing the final ${DISPLAY_TURN_LIMIT} of ${turnLog.length} exchanges)*\n\n` : '';
-
-    // Post the battle log
-    await interaction.followUp({
-      embeds: [new EmbedBuilder()
-        .setTitle('⚔️ Cult Battle in Progress...')
-        .setColor(0x6C63FF)
-        .setDescription(logHeader + displayedTurns.map(l => `• ${l}`).join('\n'))
-        .addFields(
-          { name: `${cult1.name}`, value: `${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%`, inline: true },
-          { name: `${cult2.name}`, value: `${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`, inline: true },
-        )]
-    });
 
     // Give reward role to every member of the winning cult
     try {
