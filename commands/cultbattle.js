@@ -245,6 +245,14 @@ module.exports = {
 
     const rewardedMentions = rewarded.map(id => `<@${id}>`).join(' ') || '*Nobody*';
 
+    const resultFields = [
+      { name: `🏆 Winner`, value: `**${winnerCult.name}** <@&${winnerRole.id}>` },
+      { name: `🎁 Rewarded members (${rewarded.length})`, value: rewardedMentions.slice(0, 1000) },
+    ];
+    if (failed.length > 0) {
+      resultFields.push({ name: '⚠️ Not rewarded', value: `${failed.length} member(s) couldn't receive the role (may have left the server, or the bot's role is positioned below the reward role)` });
+    }
+
     await interaction.followUp({
       embeds: [new EmbedBuilder()
         .setTitle(`🏆 ${winnerCult.name} wins the Cult Battle!`)
@@ -256,11 +264,7 @@ module.exports = {
           `${cult1.name}: ${healthBar(finalHp1, maxHp1)} ${Math.round((finalHp1 / maxHp1) * 100)}%\n` +
           `${cult2.name}: ${healthBar(finalHp2, maxHp2)} ${Math.round((finalHp2 / maxHp2) * 100)}%`
         )
-        .addFields(
-          { name: `🏆 Winner`, value: `**${winnerCult.name}** <@&${winnerRole.id}>` },
-          { name: `🎁 Rewarded members (${rewarded.length})`, value: rewardedMentions.slice(0, 1000) },
-          failed.length > 0 ? { name: '⚠️ Not rewarded', value: `${failed.length} member(s) couldn't receive the role (may have left the server)` } : null,
-        ).filter(Boolean)
+        .addFields(...resultFields)
         .setTimestamp()]
     });
   }
