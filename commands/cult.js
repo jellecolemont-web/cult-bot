@@ -483,6 +483,8 @@ module.exports = {
     const sub = interaction.options.getSubcommand();
     const guild = interaction.guild;
 
+    if (!guild) return interaction.reply({ content: '⚠️ This command can only be used inside a server.', flags: 64 });
+
     // ── REGISTER ──────────────────────────────────────────────────────────────
     if (sub === 'register') {
       const role = interaction.options.getRole('role');
